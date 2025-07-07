@@ -1,0 +1,313 @@
+name: gdp-curation-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployEnv:
+        description: 'Select a deployment environment'
+        required: true
+        type: choice
+        options:
+          - Stage
+          - Prod
+      verticalTeam:
+        description: 'Select the Vertical Team'
+        required: true
+        type: choice
+        options:
+          - 'Supply Chain'
+      branchName:
+        description: 'Enter the Branch Name to be packaged to wheel and deploy to DBFS'
+        required: true
+        type: string
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  Deploy:
+    runs-on: self-hosted
+    environment: ${{ github.event.inputs.deployEnv }}
+    env:
+      deployEnv : ${{ github.event.inputs.deployEnv}}
+      producerFolder : ${{ github.event.inputs.producer-folder || 'sourcing-insights' }}
+      JFrogRepoPath : "bia-core-data-platform-pypi-non-prod"
+      JFrogURL : "https://gapinc.jfrog.io"
+      SERVER_ID : "https://gapinc.jfrog.io/gapinc/local-non-prod"
+      verticalTeam: ${{ github.event.inputs.verticalTeam }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+            python-version: 3.9
+            cache: 'pip'
+
+      - name: Install Requirements
+        run: |
+            pwd
+            pip install -r requirements.txt > /dev/null 2>&1
+        working-directory: ${{ github.workspace }}/gha_pipeline/config
+
+      - name: Set Config File Path
+        id: set-config-path
+        run: |
+          case "${{ github.event.inputs.deployEnv }}" in
+            
+            Stage)
+              CONFIG_PATH="./gha_pipeline/curation/config/config-stage.json"
+              ;;
+            
+            Prod)
+              CONFIG_PATH="./gha_pipeline/curation/config/config-prod.json"
+              ;;
+          *)
+              echo "Unknown environment selected!"
+              exit 1
+              ;;
+          esac
+          
+          echo "CONFIG_PATH=$CONFIG_PATH" >> $GITHUB_ENV
+          echo "The configuration file path is: $CONFIG_PATH"
+
+      - name: Read Properties
+        run: |
+            # Read the gha_pipeline_config.json file and set environment variables
+            while IFS= read -r line; do
+              key=$(echo "$line" | cut -d'=' -f1)
+              value=$(echo "$line" | cut -d'=' -f2- | tr -d '"')
+            
+              echo "$key=$value" >> $GITHUB_ENV
+            
+            done < <(jq -r 'to_entries | .[] | "\(.key)=\(.value)"' $CONFIG_PATH)
+            
+            echo "deployEnv=${{ github.event.inputs.deployEnv }}" >> $GITHUB_ENV
+  
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v3
+        env:
+          ARTIFACTORY_REPO: ${{ env.JFrogRepoPath }}
+          JF_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+          JF_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          JF_URL: ${{ env.JFrogURL }}
+        with:
+          download-repository: jfrog-cli
+
+      - name: Generating Access Tokens for Deploy the Job
+        id: "pat"
+        uses: ./.github/actions/spn_token_generate
+        with:
+          client_id: ${{ secrets.CLIENT_ID }}
+          client_secret: ${{ secrets.CLIENT_SECRET }}
+          tenant_id: ${{ secrets.TENANT_ID }}
+          dburl: ${{ vars.DATABRICKS_URL }}
+
+      - name : Connect to Databricks cli
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_URL }}
+          DATABRICKS_TOKEN: ${{ env.databricks-token }}
+        run: | 
+          databricks --version
+          mkdir -p ~/.databricks
+          echo "[${{ env.deployEnv }}]" > ~/.databrickscfg
+          echo "host = ${DATABRICKS_HOST}" >> ~/.databrickscfg
+          set +x
+          echo "token = ${DATABRICKS_TOKEN}" >> ~/.databrickscfg 
+          cat ~/.databrickscfg
+          echo "Testing connection to Databricks host..."
+          if databricks jobs list > /dev/null 2>&1; then
+            echo "Connection to Databricks host ${DATABRICKS_HOST} successful."
+          else
+            echo "Failed to connect to Databricks host ${DATABRICKS_HOST}."
+            exit 1
+          fi
+        
+
+      - name: Set and Validate Branch Name
+        run: |
+            echo "Current Working Directory is ${{ github.workspace }}"
+        
+            DEPLOY_ENV="${{ inputs.deployEnv }}"
+            BRANCH_NAME="${{ inputs.branchName }}"
+        
+            # Validate for Prod environment
+            if [ "$DEPLOY_ENV" == "Prod" ]; then
+              if [ "$BRANCH_NAME" != "master" ] && [ "$BRANCH_NAME" != "main" ]; then
+                echo "❌ Error: For Prod deployments, code must be in 'master' or 'main' branch. You selected: '$BRANCH_NAME'"
+                exit 1
+              fi
+            fi
+        
+            echo "✅ Using branch: $BRANCH_NAME"
+            echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+        
+
+      - name: Setup Local Workspace
+        run: |
+          # Set the workspace folder as the code source
+          export TempGitCloneFolder=${{ github.workspace }}
+          
+          echo "Using local workspace: ${TempGitCloneFolder}"
+          echo "Current branch: ${{ github.ref_name }}"
+          
+          # List the contents of the workspace
+          ls -ltr "${TempGitCloneFolder}"
+          echo "TempGitCloneFolder=$TempGitCloneFolder" >> $GITHUB_ENV
+
+      - name: Compile Python Files
+        run: |
+          cd ${{env.TempGitCloneFolder}}
+          echo "Current Working Directory is $(pwd)" 
+          ls -ltr ${{env.TempGitCloneFolder}}
+          python3 -m compileall .
+          echo "Code Path is ${{env.TempGitCloneFolder}}"
+
+      - name : Generate Wheel File
+        run: |
+          echo "Listing specific Folder"
+          ls -ltr ${{ env.TempGitCloneFolder }}/${{env.producerFolder}}
+          echo "Completed Listing specific folder"
+          rm ${{env.TempGitCloneFolder}}/gdp_curation/generate_gdp_curation_library.py
+          ls -ltr ${{ env.TempGitCloneFolder }}/${{env.producerFolder}}
+          cp ${{github.workspace}}/gha_pipeline/curation/build-starter-files/generate_${{env.producerFolder}}_library.py ${{env.TempGitCloneFolder}}/${{env.producerFolder}}/
+          cd ${{ env.TempGitCloneFolder }}/${{env.producerFolder}}
+          cat generate_${{env.producerFolder}}_library.py
+
+          pwd
+        
+          if [ -d "dist" ]; then
+            echo "Cleaning dist directory"
+            rm -r dist/*
+          fi
+          
+          ls
+          
+          echo "Building the wheel file"
+          python3 generate_${{ env.producerFolder }}_library.py bdist_wheel  # Changed from bdist_egg to bdist_wheel
+          
+          echo "ls are : "
+          ls
+          echo "ls dist are : "
+          ls dist
+
+          WHEEL_FILE=$(ls dist/*.whl)
+          echo "Captured wheel file: $WHEEL_FILE"
+          
+          # Extract the file name (remove the dist/ part)
+          WHEEL_FILE_NAME=$(basename $WHEEL_FILE)
+          echo "wheelName=${WHEEL_FILE_NAME}" >> $GITHUB_ENV 
+
+          # Creating a Directory
+          mkdir -p wheel-files
+          cp dist/*.whl wheel-files/
+          cp -r ${{ env.TempGitCloneFolder }}/${{env.producerFolder}}/config/ wheel-files/
+          cp ${{ env.TempGitCloneFolder }}/${{env.producerFolder}}/${{ env.jobMainFile }} wheel-files/
+          echo "Wheel files folder contains"
+          ls wheel-files
+
+      - name: Artifact Upload to Github Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+            name: ${{ env.wheelName }}
+            path: ${{ env.TempGitCloneFolder }}/dist/${{ env.wheelName }}
+
+      - name: Build Number Generation
+        run: |
+            buildNumber=${{ github.run_number }}.${{ github.run_attempt }}
+            echo "buildNumber=$buildNumber" >> $GITHUB_ENV
+            echo "Build Folder would be $buildNumber"
+
+      - name: Uploading to JFrog and Copying to Databricks File System and Volumes
+        run: |
+          ls -ltr ${{ env.TempGitCloneFolder }}/dist
+          echo "Done"
+          tar -zvcf artifacts.tgz ${{ env.TempGitCloneFolder }}/wheel-files/*
+          echo "tar artifact done"
+          curl -u ${{secrets.ARTIFACTORY_USERNAME}}:${{secrets.ARTIFACTORY_PASSWORD}} -T artifacts.tgz "${{env.SERVER_ID}}/gdp_curation/${{ env.producerFolder }}/${{env.buildNumber}}/file/"
+  
+          databricks --version
+          
+          # Copy main job file if it exists
+          if [ -n "${{ env.jobMainFile }}" ] && [ -f "${{ env.TempGitCloneFolder }}/${{ env.jobMainFile }}" ]; then
+            dbfs cp ${{ env.TempGitCloneFolder }}/${{ env.jobMainFile }} dbfs:/GDP_curation/${{env.verticalTeam}}/build/${{env.buildNumber}}/${{env.jobMainFile}}  --profile ${{env.deployEnv}}
+          fi
+
+          dbfs cp ${{ env.TempGitCloneFolder }}/dist/*.whl dbfs:/GDP_curation/${{env.verticalTeam}}/build/${{env.buildNumber}}/  --profile ${{env.deployEnv}}
+
+          # Copy metadata and transformation files
+          if [ -d "${{ env.TempGitCloneFolder }}/metadata" ]; then
+            dbfs cp ${{ env.TempGitCloneFolder }}/metadata/ dbfs:/GDP_curation/${{env.verticalTeam}}/build/${{env.buildNumber}}/platform/metadata  --profile ${{env.deployEnv}} --recursive
+          fi
+          
+          if [ -d "${{ env.TempGitCloneFolder }}/transformation" ]; then
+            dbfs cp ${{ env.TempGitCloneFolder }}/transformation/ dbfs:/GDP_curation/${{env.verticalTeam}}/build/${{env.buildNumber}}/platform/transformation  --profile ${{env.deployEnv}} --recursive
+          fi
+
+          echo "DBFS Contents are "
+          dbfs ls dbfs:/GDP_curation/${{env.verticalTeam}}/build/${{env.buildNumber}}  --profile ${{env.deployEnv}}
+          dbfs ls dbfs:/GDP_curation/${{env.verticalTeam}}/build/${{env.buildNumber}}/platform  --profile ${{env.deployEnv}}
+          
+          copy_files_recursive() {
+              local src_dir="$1"
+              local dest_dir="$2"
+              
+              # Loop through all files and directories in the source directory
+              for item in "$src_dir"/*; do
+                  if [ -d "$item" ]; then
+                      # If item is a directory, check if it is named "metadata" or "transformation"
+                      if [ "$(basename "$item")" == "metadata" ] || [ "$(basename "$item")" == "transformation" ]; then
+                          # If it is named "metadata" or "transformation", put it under "platform" in the destination
+                          echo "Processing directory: $item (Moving to platform folder)"
+                          copy_files_recursive "$item" "$dest_dir/platform/$(basename "$item")"
+                      else
+                          # If it is another directory, just recursively call the function with its name
+                          echo "Processing directory: $item"
+                          copy_files_recursive "$item" "$dest_dir/$(basename "$item")"
+                      fi
+                  elif [ -f "$item" ]; then
+                      # If item is a file, upload it to Databricks
+                      file_local_path="$item"
+                      file_encoded_path=$(realpath "$file_local_path")  # Get absolute path
+                      file_encoded_url="${{ vars.DATABRICKS_URL }}/api/2.0/fs/files/${dest_dir}/$(basename "$file_encoded_path")?overwrite=true"
+
+                      # Debugging: Print values to check if they are correct
+                      echo "Encoded Path: $file_encoded_path"
+                      echo "Encoded URL: $file_encoded_url"
+
+                      # Build the curl command to upload the file to Databricks
+                      curl_command="curl -X PUT -H 'Authorization: Bearer ${{ env.databricks-token }}' --data-binary @$file_encoded_path $file_encoded_url"
+                      curl_result=$(eval $curl_command)
+                      echo "$curl_result"
+                      echo "Uploaded $(basename "$item") to Databricks"
+                  fi
+              done
+          }
+
+
+          echo "Copying to Volumes"
+          # Call the function to start copying from the wheel-files directory
+          copy_files_recursive "${{ env.TempGitCloneFolder }}/wheel-files" "${{ env.VolumesPath }}/${{env.verticalTeam}}/build/${{ env.buildNumber }}"
+          echo "Uploaded build files to Databricks Volumes"
+
+      - name: Revoke Databricks Token
+        run: |
+            TOKEN_ID="${{ env.databricks-token-id }}"  
+            DATABRICKS_URL="${{ vars.DATABRICKS_URL }}" 
+        
+            # Use curl to revoke the token
+            response=$(curl -s -w "%{http_code}" -o response.txt -X POST \
+              "${DATABRICKS_URL}/api/2.0/token/delete" \
+              -H "Authorization: Bearer ${{ env.databricks-token }}" \
+              -d "{\"token_id\": \"$TOKEN_ID\"}")
+        
+            http_status=$(echo "$response" | tail -n 1)
+            if [[ "$http_status" == "200" ]]; then
+              echo "Token revoked successfully."
+            else
+              echo "Failed to revoke token. Response: $(cat response.txt)"
+              exit 1
+            fi
