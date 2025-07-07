@@ -1,0 +1,180 @@
+name: Deploy Curation Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployEnv:
+        description: 'Select a deployment environment'
+        required: true
+        type: choice
+        options:
+          - Dev
+          - Stage
+          - Preprod
+          - Prod
+      verticalTeam:
+        description: 'Select the Vertical Team'
+        required: true
+        type: choice
+        options:
+          - Channel
+          - Customer
+          - Finance
+          - Inventory
+          - Supply Chain
+      branchName:
+        description: 'Enter the branch name (used for Prod → must be "main" or "master")'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  Deploy:
+    runs-on: self-hosted
+    environment: ${{ github.event.inputs.deployEnv }}
+    env:
+      deployEnv: ${{ github.event.inputs.deployEnv }}
+      JFrogRepoPath: bia-core-data-platform-pypi-non-prod
+      JFrogURL: https://abc.jfrog.io
+      SERVER_ID: https://abc.jfrog.io/abc/local-non-prod
+      verticalTeam: ${{ github.event.inputs.verticalTeam }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.9
+          cache: pip
+
+      - name: Install Requirements (workflow configs)
+        run: |
+          pip install -r requirements.txt > /dev/null 2>&1
+        working-directory: ${{ github.workspace }}/gha_pipeline/config
+
+      - name: Set Config File Path
+        id: set-config-path
+        run: |
+          case "${{ github.event.inputs.deployEnv }}" in
+            Dev) CONFIG_PATH="gha_pipeline/curation/config/config-dev.json" ;;
+            Stage) CONFIG_PATH="gha_pipeline/curation/config/config-stage.json" ;;
+            Preprod) CONFIG_PATH="gha_pipeline/curation/config/config-preprod.json" ;;
+            Prod) CONFIG_PATH="gha_pipeline/curation/config/config-prod.json" ;;
+            *) echo "Unknown environment selected!" && exit 1 ;;
+          esac
+          echo "CONFIG_PATH=$CONFIG_PATH" >> $GITHUB_ENV
+          echo "Selected config: $CONFIG_PATH"
+
+      - name: Read environment-specific config
+        run: |
+          while IFS= read -r line; do
+            key=$(echo "$line" | cut -d'=' -f1)
+            value=$(echo "$line" | cut -d'=' -f2- | tr -d '"')
+            echo "$key=$value" >> $GITHUB_ENV
+          done < <(jq -r 'to_entries | .[] | "\(.key)=\(.value)"' ${{ env.CONFIG_PATH }})
+          echo "deployEnv=${{ github.event.inputs.deployEnv }}" >> $GITHUB_ENV
+
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v3
+        env:
+          ARTIFACTORY_REPO: ${{ env.JFrogRepoPath }}
+          JF_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+          JF_PASSWORD: ${{ secrets.ARTIFACTORY_PASSWORD }}
+          JF_URL: ${{ env.JFrogURL }}
+        with:
+          download-repository: jfrog-cli
+
+      - name: Generate access token for Databricks
+        id: pat
+        uses: ./.github/actions/spn_token_generate
+        with:
+          client_id: ${{ secrets.CLIENT_ID }}
+          client_secret: ${{ secrets.CLIENT_SECRET }}
+          tenant_id: ${{ secrets.TENANT_ID }}
+          dburl: ${{ vars.DATABRICKS_URL }}
+
+      - name: Connect to Databricks CLI
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_URL }}
+          DATABRICKS_TOKEN: ${{ env.databricks-token }}
+        run: |
+          mkdir -p ~/.databricks
+          echo "[${{ env.deployEnv }}]" > ~/.databrickscfg
+          echo "host = ${DATABRICKS_HOST}" >> ~/.databrickscfg
+          set +x
+          echo "token = ${DATABRICKS_TOKEN}" >> ~/.databrickscfg
+          echo "Connection test:"
+          databricks jobs list --profile ${{ env.deployEnv }}
+
+      - name: Set and Validate Branch Name
+        run: |
+          DEPLOY_ENV="${{ inputs.deployEnv }}"
+          BRANCH_NAME=$(echo "${{ inputs.branchName }}" | xargs)
+          if [[ "$DEPLOY_ENV" == "Prod" ]]; then
+            if [[ -z "$BRANCH_NAME" ]]; then
+              echo "Error: branchName is required for Prod" && exit 1
+            elif [[ "$BRANCH_NAME" != "main" && "$BRANCH_NAME" != "master" ]]; then
+              echo "❌ Prod deployments must come from main/master; got '$BRANCH_NAME'" && exit 1
+            fi
+          fi
+          echo "Using branch: $BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Compile Python files
+        run: |
+          cd ${{ github.workspace }}
+          python3 -m compileall .
+
+      - name: Generate Wheel File
+        run: |
+          ls -ltr ${{ github.workspace }}
+          rm -f ${{ github.workspace }}/gdp_curation/generate_gdp_curation_library.py
+          cp ${{ github.workspace }}/gha_pipeline/curation/build-starter-files/generate_library.py ${{ github.workspace }}/
+          cd ${{ github.workspace }}
+          if [ -d dist ]; then rm -r dist; fi
+          python3 generate_library.py bdist_wheel
+          echo "dist contents:" && ls dist
+          WHEEL_FILE=$(ls dist/*.whl)
+          echo "wheelName=$(basename $WHEEL_FILE)" >> $GITHUB_ENV
+          mkdir -p wheel-files
+          cp dist/*.whl wheel-files/
+          cp -r config/ wheel-files/
+          cp ${{ env.jobMainFile }} wheel-files/
+          ls -ltr wheel-files
+
+      - name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.wheelName }}
+          path: wheel-files
+
+      - name: Generate build number
+        run: |
+          echo "buildNumber=${{ github.run_number }}.${{ github.run_attempt }}" >> $GITHUB_ENV
+
+      - name: Upload to JFrog and Databricks
+        run: |
+          tar -zvcf artifacts.tgz wheel-files/*
+          curl -u ${{ secrets.ARTIFACTORY_USERNAME }}:${{ secrets.ARTIFACTORY_PASSWORD }} \
+            -T artifacts.tgz "${{ env.SERVER_ID }}/gdp_curation/${{ env.verticalTeam }}/${{ env.buildNumber }}/file/"
+          databricks fs cp wheel-files/*.whl dbfs:/GDP_curation/${{ env.verticalTeam }}/build/${{ env.buildNumber }}/ --profile ${{ env.deployEnv }}
+          databricks fs cp wheel-files/${{ env.jobMainFile }} dbfs:/GDP_curation/${{ env.verticalTeam }}/build/${{ env.buildNumber }}/ --profile ${{ env.deployEnv }}
+          databricks fs cp wheel-files/config/ dbfs:/GDP_curation/${{ env.verticalTeam }}/build/${{ env.buildNumber }}/platform/ --recursive --profile ${{ env.deployEnv }}
+
+      - name: Revoke Databricks token
+        run: |
+          TOKEN_ID="${{ env.databricks-token-id }}"
+          response=$(curl -s -w "%{http_code}" -o /tmp/resp.txt \
+            -X POST "${{ vars.DATABRICKS_URL }}/api/2.0/token/delete" \
+            -H "Authorization: Bearer ${{ env.databricks-token }}" \
+            -d "{\"token_id\":\"$TOKEN_ID\"}")
+          if [[ "${response:(-3)}" == "200" ]]; then
+            echo "Token revoked"
+          else
+            echo "Failed to revoke token" && cat /tmp/resp.txt && exit 1
+          fi
